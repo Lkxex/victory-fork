@@ -1,8 +1,14 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+The [live ray tracing integration](https://github.com/fxceless/victory-fork/pull/905)
+lit the opening cell on an RTX 3080 in Series S mode. The builder reported
+53 host pipelines in that run. This branch carries the integration onto
+the newer main and still needs an in-game run on the new base.
+
+To enable live lighting, use `--console series-s` with
+`VICTORY_BVH_BUILDER=1` and `VICTORY_BVH_QUARANTINE=0`. The reported run
+also used `VICTORY_CARD_FETCH_INFLIGHT=1`, `VICTORY_TEXTURE_DROP_MIPS=1`,
+and `VICTORY_TEXTURE_ROOM_PERCENT=82`.
 
 ## What the title does
 
@@ -49,7 +55,7 @@ shaders and emulates the one instruction.
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
    `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
-   over 311 ray/node cases and compare with the reference bit for bit.
+   over 313 ray/node cases and compare with the reference bit for bit.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
@@ -63,15 +69,15 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
+- The earlier RTX 3080 test ran out of memory with the Series X profile
+  shortly after the builder started. The Series S scene rendered, with
+  visible grain in the lit image.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
+  of two boxes entered at the same distance, the result for a ray exactly
+  through an edge, and what a child that is not there returns when the ray
+  enters its box (here: a miss).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
