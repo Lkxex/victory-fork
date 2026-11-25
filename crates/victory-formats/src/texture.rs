@@ -772,7 +772,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
         60..=65 | 190 => (1, 1, false),
@@ -898,7 +898,7 @@ mod tests {
     fn console_formats_use_the_expected_color_layouts() {
         for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
             // Compare against RGBA8 (28) or R8 (61), which have the same texel size.
-            for (format, reference) in [(189, 28), (190, 61), (191, 28)] {
+            for (format, reference) in [(189, 28), (190, 61)] {
                 let desc = TextureDesc {
                     dimension: Dimension::Tex2d,
                     width: 257,
