@@ -243,6 +243,8 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// One shared dword per lane for a backward permute across two host waves.
+    permute_scratch: Option<u32>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1270,6 +1272,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut permute_scratch = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1398,6 +1401,24 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+                // Limit the exchange to one complete console wave in an acyclic
+                // group. Group barriers cannot join independently
+                // diverging console waves or lanes that exit at a loop limit.
+                if exchange.is_some()
+                    && group == 64
+                    && super::group_sync() != 0
+                    && s.lds_dwords + 64 <= 8192
+                    && insts().any(|inst| inst.name() == "ds_bpermute_b32")
+                    && x.st.exits.iter().enumerate().all(|(b, exit)| match *exit {
+                        LaneExit::Jump(target) => target > b,
+                        LaneExit::Branch { taken, not_taken, .. } => taken > b && not_taken > b,
+                        LaneExit::End => true,
+                        LaneExit::Indirect => false,
+                    })
+                {
+                    permute_scratch = Some(s.lds_dwords);
+                    s.lds_dwords += 64;
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1555,6 +1576,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            permute_scratch,
             clane: None,
             pair: None,
             halves,
@@ -2795,6 +2817,12 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        let (slot, byte, _) = self.memory_location(lo, hi, guard);
+        (self.memory_handle(slot), byte)
+    }
+
+    /// The raw view's heap slot, byte offset and whether the page has a copy.
+    fn memory_location(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2828,7 +2856,8 @@ impl<'a> Lower<'a> {
         // A page without a copy: its number, at a place by the number, or
         // at the sink for lanes that do not run and pages that have one.
         let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let absent = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let mut missing = absent;
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
@@ -2852,11 +2881,16 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        let yes = self.s.m.bool(true);
+        let resident = self.s.m.bin(c, Bin::Xor, absent, yes);
+        (slot, byte, resident)
+    }
+
+    fn memory_handle(&mut self, slot: V) -> V {
+        self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0))
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -3868,6 +3902,10 @@ impl<'a> Lower<'a> {
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
         };
+        self.mask_lane_bit(at, lane, lo, hi)
+    }
+
+    fn mask_lane_bit(&mut self, at: usize, lane: V, lo: V, hi: Option<V>) -> V {
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -4429,15 +4467,7 @@ impl<'a> Lower<'a> {
             // the title's checkerboard shadow-mask generators read their
             // neighbours' samples with it; without them every shadowed light
             // was multiplied by an empty mask.)
-            // shortcut: a source lane that is not at this instruction on the
-            // host (it left through a branch, not a guard) is read as the
-            // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
@@ -4446,14 +4476,45 @@ impl<'a> Lower<'a> {
             let src = self.s.m.bin(c, Bin::LShr, at, two);
             let last = self.s.m.i32(self.wave() - 1);
             let src = self.s.m.bin(c, Bin::And, src, last);
-            let x = match guard {
-                Some(g) => {
-                    let z = self.s.m.i32(0);
-                    self.s.m.select(c, g, x, z)
+            let zero = self.s.m.i32(0);
+            let r = if self.exchange.as_ref().is_some_and(|e| !e.1) {
+                let Some(slot) = self.permute_scratch.filter(|_| !self.local) else {
+                    return Err("a lane permute across two host waves");
+                };
+                if !self.all_lanes(b) {
+                    need(b);
+                    return Err("a lane permute where not every lane runs");
                 }
-                None => x,
+                // Publish the EXEC-masked source at its console lane. Both
+                // host waves can then load from either half of the wave.
+                let lane = self.console_lane();
+                let base = self.s.m.i32(slot);
+                let mine = self.s.m.bin(c, Bin::Add, base, lane);
+                let lds = self.s.lds();
+                let ptr = self.s.m.element(c, lds, mine);
+                let x = guard.map_or(x, |active| self.s.m.select(c, active, x, zero));
+                self.s.m.store(c, ptr, x);
+                self.group_sync(c);
+                let index = self.s.m.bin(c, Bin::Add, base, src);
+                let ptr = self.s.m.element(c, lds, index);
+                let result = self.s.m.load(c, ptr);
+                // Keep the next permute from overwriting a pending read.
+                self.group_sync(c);
+                result
+            } else {
+                // The host leaves reads from inactive lanes undefined.
+                // Check EXEC and the host's live lanes before asking for a read.
+                let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+                let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+                let lo = self.s.m.extract(c, ballot, 0);
+                let hi = (self.wave() == 64).then(|| self.s.m.extract(c, ballot, 1));
+                let source_active = self.mask_lane_bit(c, src, lo, hi);
+                let here = self.lane_index();
+                let lane = self.s.m.select(c, source_active, src, here);
+                let value = self.read_lane(x, lane);
+                self.s.m.select(c, source_active, value, zero)
             };
-            let r = self.read_lane(x, src);
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
