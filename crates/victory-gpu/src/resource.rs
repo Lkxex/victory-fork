@@ -3053,6 +3053,67 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run with VICTORY_GPU_DETILE=1 on D3D12"]
+    fn title_texture_upload_runs_gpu_detile_from_the_prelude() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let host = crate::host::host().expect("D3D12 required");
+        let mut desc = texture(512, 512, 28, 2);
+        desc.layout = 0x10a;
+        let layout = super::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        let mut title = std::ptr::null();
+        let nil = std::ptr::null();
+        assert_eq!(create_committed(nil, &PROPERTIES, 0, &desc, 0, nil.cast(), &RESOURCE_IIDS[0], &mut title), S_OK);
+        let (memory, _) = super::texture_memory(title).unwrap();
+        let expected = [0x21u8, 0xe9, 0x69, 0xff];
+        let source = layout.offset(0, 21, 19, 0).unwrap() as usize;
+        // SAFETY: the title resource owns its committed texture backing.
+        unsafe { memory.cast_mut().add(source).cast::<[u8; 4]>().write_unaligned(expected) };
+        let image = super::host_resource(title).unwrap();
+        let back = host.read_back_buffer(512 * 512 * 4).unwrap();
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, title, image);
+        assert!(crate::texture::uses_gpu_detile(title));
+        crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // SAFETY: an open list and two live resources. RGBA8 at 512 texels per
+        // row already meets D3D12's pitch alignment.
+        unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(image),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&back),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Width: 512,
+                            Height: 512,
+                            Depth: 1,
+                            RowPitch: 2048,
+                        },
+                    },
+                },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            let offset = 19 * 2048 + 21 * 4;
+            let actual = mapped.cast::<u8>().add(offset).cast::<[u8; 4]>().read_unaligned();
+            back.Unmap(0, None);
+            assert_eq!(actual, expected);
+        }
+        drop(list);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(title, 0x10)(title), 0);
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]

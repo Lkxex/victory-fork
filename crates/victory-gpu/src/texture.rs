@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
+mod gpu_detile;
+
 use crate::host::{HostList, host};
 use crate::object::This;
 
@@ -34,6 +36,7 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    gpu_detile: Option<gpu_detile::GpuDetile>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -700,6 +703,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    if staging.gpu_detile.is_some() {
+        list.defer_gpu_detile(staging.clone());
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -748,6 +754,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    if staging.gpu_detile.is_some() {
+        // SAFETY: the copies promoted the prelude's buffer to COPY_SOURCE.
+        // The next list's prelude starts from COMMON again.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &staging.buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -898,6 +915,13 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// Records the GPU conversion for a texture this list will upload.
+    pub(crate) fn record_gpu_detile(&self, list: &ID3D12GraphicsCommandList) {
+        if let Some(gpu_detile) = &self.gpu_detile {
+            gpu_detile.record(list);
+        }
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -1143,6 +1167,10 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(gpu_detile) = &self.gpu_detile {
+            gpu_detile.fill(tiled);
+            return;
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1255,6 +1283,13 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+}
+
+#[cfg(test)]
+pub(crate) fn uses_gpu_detile(resource: This) -> bool {
+    STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(|staging| staging.gpu_detile.is_some())
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
@@ -1464,18 +1499,40 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    let writable = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+        | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+    let gpu_detile = if gpu_detile::enabled()
+        && !on_demand
+        && d.Flags.0 & writable == 0
+        && d.SampleDesc.Count == 1
+        && layout.size >= 1 << 20
+    {
+        gpu_detile::GpuDetile::new(host, &layout, &footprints, &rows, total)
+    } else {
+        None
+    };
+    let (buffer, data, pooled) = if let Some(conversion) = &gpu_detile {
+        for footprint in &mut footprints {
+            footprint.Offset += conversion.linear_base;
+        }
+        (conversion.scratch.clone(), std::ptr::null_mut(), 0)
+    } else {
+        staging_buffer(host, total)?
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, gpu_detile = gpu_detile.is_some(), "texture contents uploaded from title memory");
+    let staged_bytes = gpu_detile.as_ref().map_or(total, gpu_detile::GpuDetile::bytes);
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(staged_bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        gpu_detile,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
@@ -1483,7 +1540,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        bytes: total,
+        bytes: staged_bytes,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
